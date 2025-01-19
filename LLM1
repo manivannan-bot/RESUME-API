@@ -1,0 +1,134 @@
+from flask import Flask, request, jsonify
+from transformers import pipeline
+import base64
+from pdf2image import convert_from_bytes
+import pytesseract
+import re
+import os
+import sys
+
+app = Flask(__name__)
+
+# Windows-specific path configuration
+POPPLER_PATH = os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), 'poppler', 'Library', 'bin')
+TESSERACT_PATH = os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), 'Tesseract-OCR', 'tesseract.exe')
+
+# Set Tesseract path for Windows
+if os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# Initialize the model
+extractor = pipeline('text2text-generation', model='google/flan-t5-small', max_length=512)
+
+def check_dependencies():
+    """Check if required dependencies are installed"""
+    errors = []
+    
+    # Check Poppler
+    if not os.path.exists(POPPLER_PATH):
+        errors.append(
+            "Poppler is not found. Please:\n"
+            "1. Download from https://github.com/oschwartz10612/poppler-windows/releases/\n"
+            "2. Extract to C:\\Program Files\\poppler\n"
+            "3. Add C:\\Program Files\\poppler\\Library\\bin to system PATH"
+        )
+    
+    # Check Tesseract
+    if not os.path.exists(TESSERACT_PATH):
+        errors.append(
+            "Tesseract is not found. Please:\n"
+            "1. Download from https://github.com/UB-Mannheim/tesseract/wiki\n"
+            "2. Install to C:\\Program Files\\Tesseract-OCR"
+        )
+    
+    return errors
+
+def extract_text_from_pdf(base64_string):
+    """Convert base64 PDF to text with Windows-specific configuration"""
+    try:
+        # Check dependencies first
+        errors = check_dependencies()
+        if errors:
+            raise Exception("\n".join(errors))
+        
+        # Decode base64 string
+        pdf_bytes = base64.b64decode(base64_string)
+        
+        # Convert PDF to images using Windows path
+        images = convert_from_bytes(
+            pdf_bytes,
+            poppler_path=POPPLER_PATH
+        )
+        
+        # Extract text from each image
+        text = ""
+        for image in images:
+            text += pytesseract.image_to_string(image) + "\n"
+        
+        return text.strip()
+        
+    except Exception as e:
+        raise Exception(f"PDF processing failed: {str(e)}")
+
+def extract_information(text):
+    """Extract required information using the model"""
+    prompts = {
+        'name': f"Extract the full name from this resume: {text[:1000]}",
+        'email': f"Extract the email address from this text: {text[:1000]}",
+        'phone': f"Extract the phone number from this text: {text[:1000]}",
+        'experience': f"How many years of experience are mentioned in this text: {text[:1000]}",
+        'last_company': f"What is the most recent company name mentioned in this text: {text[:1000]}"
+    }
+    
+    result = {}
+    
+    for field, prompt in prompts.items():
+        response = extractor(prompt, max_length=50)[0]['generated_text'].strip()
+        
+        if field == 'email':
+            email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', response)
+            result[field] = email_match.group(0) if email_match else None
+        elif field == 'phone':
+            phone_match = re.search(r'[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}', response)
+            result[field] = phone_match.group(0) if phone_match else None
+        elif field == 'experience':
+            year_match = re.search(r'(\d+)(?:\s*(?:years|year|yrs|yr))', response.lower())
+            result[field] = f"{year_match.group(1)} years" if year_match else None
+        elif field == 'name':
+            # Clean the name to exclude phone numbers or irrelevant parts
+            name_cleaned = re.sub(r'\d+|\s*Mobile No.*', '', response).strip()
+            result[field] = name_cleaned if name_cleaned else None
+        elif field == 'last_company':
+            # Extract company name-like phrases
+            company_cleaned = re.sub(r'\s*Mobile No.*', '', response).strip()
+            if re.search(r'\b(Inc\.|Ltd\.|Technologies|Corp\.|Pvt\.|Company|Solutions)\b', company_cleaned, re.IGNORECASE):
+                result[field] = company_cleaned
+            else:
+                result[field] = None
+    
+    return result
+
+
+@app.route('/parse_resume', methods=['POST'])
+def parse_resume():
+    try:
+        # Get the base64 string from request
+        data = request.get_json()
+        if not data or 'base64_pdf' not in data:
+            return jsonify({'error': 'No base64 PDF string provided'}), 400
+        
+        # Extract text from PDF
+        text = extract_text_from_pdf(data['base64_pdf'])
+        if not text:
+            return jsonify({'error': 'No text could be extracted from the PDF'}), 400
+        
+        # Extract information using the model
+        result = extract_information(text)
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
