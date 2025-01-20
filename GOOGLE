@@ -1,0 +1,106 @@
+from flask import Flask, request, jsonify
+import base64
+import os
+import re
+from transformers import pipeline
+import pdfplumber
+
+app = Flask(__name__)
+
+# Initialize the LLM model for text generation
+model = pipeline("text2text-generation", model="google/flan-t5-small", max_length=512)
+
+# Function to extract text from PDF
+def extract_text_from_pdf(pdf_path):
+    """
+    Extracts text from a PDF file using pdfplumber.
+    """
+    try:
+        text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text()
+        return text.strip()
+    except Exception as e:
+        raise Exception(f"Error extracting text from PDF: {e}")
+
+# Function to extract structured information from text
+def extract_information_from_text(text):
+    """
+    Extracts information like name, email, phone, experience, and last company
+    from the given text using an LLM and regex.
+    """
+    prompts = {
+        'name': f"Extract the full name from this resume: {text}",
+        'email': f"Extract the email address from this text: {text}",
+        'phone': f"Extract the phone number from this text: {text}",
+        'experience': f"guess years of professional experience mentioned in this text: {text}",
+        'last_company': f"What is the most recent company mentioned in this text: {text}"
+    }
+
+    result = {}
+    for key, prompt in prompts.items():
+        response = model(prompt)[0]['generated_text'].strip()
+        print(response)
+        # Post-processing and validation
+        if key == 'email':
+            email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', response)
+            result[key] = email_match.group(0) if email_match else None
+        elif key == 'phone':
+            phone_match = re.search(r'\+?[0-9\s\-()]{7,15}', response)
+            result[key] = phone_match.group(0) if phone_match else None
+        else:
+            result[key] = response
+
+    return result
+
+@app.route('/encode_pdf', methods=['POST'])
+def encode_pdf():
+    """
+    Encodes a PDF file into a Base64 string.
+    """
+    try:
+        pdf_file = request.files['file']
+        pdf_data = pdf_file.read()
+        encoded_pdf = base64.b64encode(pdf_data).decode('utf-8')
+        return jsonify({"encoded_pdf": encoded_pdf})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/extract_info', methods=['POST'])
+def extract_info():
+    """
+    Extracts information from a Base64-encoded PDF resume.
+    """
+    try:
+        # Get Base64 string from request
+        data = request.json.get("resume_base64")
+        if not data:
+            return jsonify({"error": "No Base64 string provided"}), 400
+
+        # Decode the Base64 string into bytes
+        resume_bytes = base64.b64decode(data)
+
+        # Save the decoded bytes as a temporary PDF file
+        temp_path = "temp_resume.pdf"
+        with open(temp_path, "wb") as f:
+            f.write(resume_bytes)
+
+        # Extract text from the PDF
+        resume_text = extract_text_from_pdf(temp_path)
+        if not resume_text:
+            return jsonify({"error": "No text could be extracted from the PDF"}), 400
+
+        # Extract structured information from the text
+        extracted_info = extract_information_from_text(resume_text)
+
+        # Clean up the temporary file
+        os.remove(temp_path)
+
+        return jsonify(extracted_info)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
